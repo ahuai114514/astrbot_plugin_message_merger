@@ -1,0 +1,23 @@
+{
+  "enabled": {
+    "description": "是否启用消息乐观合并",
+    "type": "bool",
+    "default": true
+  },
+  "max_messages": {
+    "description": "一次最多合并的消息条数，设为 0 则不限制",
+    "type": "int",
+    "default": 8
+  },
+  "max_chars": {
+    "description": "一次最多合并的字符数，设为 0 则不限制",
+    "type": "int",
+    "default": 4000
+  },
+  "ignore_prefixes": {
+    "description": "以这些前缀开头的消息不参与合并",
+    "type": "list",
+    "items": {"type": "string"},
+    "default": ["/", "!"]
+  }
+}

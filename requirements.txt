@@ -1,0 +1,1 @@
+# AstrBot provides the runtime API; no third-party dependencies are required.

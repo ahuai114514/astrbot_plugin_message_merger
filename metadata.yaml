@@ -1,0 +1,8 @@
+name: astrbot_plugin_message_merger
+display_name: message_merger
+short_desc: 立即回复并在后续消息到达时乐观合并
+desc: 首条消息立即请求模型；同一用户的后续消息会在旧回复发送前触发合并重试，避免固定等待造成的迟滞。
+version: v1.0.0
+author: Codex
+repo: https://github.com/ahuai114514/astrbot_plugin_message_merger
+astrbot_version: ">=4.16,<5"
