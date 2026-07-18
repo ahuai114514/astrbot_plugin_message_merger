@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,10 +18,12 @@ EXTRA_PREFIX = "message_merger"
 class Burst:
     messages: list[str] = field(default_factory=list)
     current_event: AstrMessageEvent | None = None
+    pipeline_task: asyncio.Task[Any] | None = None
+    tools_started: bool = False
     updated_at: float = field(default_factory=time.monotonic)
 
 
-@register(PLUGIN_ID, "Codex", "立即回复并在后续消息到达时乐观合并", "1.0.1")
+@register(PLUGIN_ID, "Codex", "零等待取消旧请求并合并后续消息", "1.1.0")
 class MessageMergerPlugin(Star):
     """Merge follow-up user messages without delaying the initial request."""
 
@@ -29,21 +32,50 @@ class MessageMergerPlugin(Star):
         self.config = config
         self._bursts: dict[str, Burst] = {}
 
-    @filter.regex(r"^[\s\S]*$")
-    async def capture_incoming_message(self, event: AstrMessageEvent):
-        """Capture before the event reaches the per-conversation LLM queue."""
+    @filter.regex(r"^[\s\S]*$", priority=-10000)
+    async def capture_incoming_message(self, event: AstrMessageEvent) -> None:
+        """Run after business handlers but before the default LLM pipeline."""
         if self._is_early_llm_candidate(event):
             self._capture(event)
-        if False:
-            # Regex handlers are async generators in AstrBot's plugin pipeline.
-            yield None
 
     @filter.on_waiting_llm_request(priority=1000)
-    async def collect_message(self, event: AstrMessageEvent) -> None:
+    async def register_pipeline_task(self, event: AstrMessageEvent) -> None:
         # Some adapters decide call_llm after regular handlers; capture those here.
         if event.get_extra(self._extra_key("captured"), False):
+            key = event.get_extra(self._extra_key("key"), None)
+        else:
+            self._capture(event)
+            key = event.get_extra(self._extra_key("key"), None)
+
+        if not isinstance(key, str):
             return
-        self._capture(event)
+        burst = self._bursts.get(key)
+        if burst is None or burst.current_event is not event:
+            event.set_extra(self._extra_key("stale"), True)
+            event.stop_event()
+            return
+
+        messages = event.get_extra(self._extra_key("merged_messages"), None)
+        if isinstance(messages, list):
+            parts = [item.strip() for item in messages if isinstance(item, str) and item.strip()]
+            if parts:
+                merged = self._join_messages(parts)
+                event.message_str = merged
+                message_obj = getattr(event, "message_obj", None)
+                if message_obj is not None:
+                    message_obj.message_str = merged
+
+        task = asyncio.current_task()
+        if task is None:
+            return
+        burst.pipeline_task = task
+        task.add_done_callback(
+            lambda completed, burst_key=key, current_event=event: self._on_pipeline_done(
+                burst_key,
+                current_event,
+                completed,
+            )
+        )
 
     def _capture(self, event: AstrMessageEvent) -> None:
         if not self._enabled():
@@ -55,14 +87,19 @@ class MessageMergerPlugin(Star):
 
         self._prune_bursts()
         burst = self._bursts.get(key)
+        if burst is not None and self._must_start_new_burst(burst):
+            burst = None
         if burst is None:
             burst = Burst()
             self._bursts[key] = burst
         else:
             previous = burst.current_event
             if previous is not None and previous is not event:
-                # The previous LLM result may still be running; suppress it at send time.
                 previous.set_extra(self._extra_key("stale"), True)
+                previous_task = burst.pipeline_task
+                burst.pipeline_task = None
+                if previous_task is not None and not previous_task.done():
+                    previous_task.cancel()
 
         max_messages = self._safe_int("max_messages", 8, minimum=0)
         max_chars = self._safe_int("max_chars", 4000, minimum=0)
@@ -88,12 +125,19 @@ class MessageMergerPlugin(Star):
             event.stop_event()
             return
 
-        messages = event.get_extra(self._extra_key("merged_messages"), None)
-        if not isinstance(messages, list) or len(messages) < 2:
+    @filter.on_using_llm_tool(priority=1000)
+    async def mark_tool_started(
+        self,
+        event: AstrMessageEvent,
+        tool: Any,
+        tool_args: dict[str, Any] | None,
+    ) -> None:
+        key = event.get_extra(self._extra_key("key"), None)
+        if not isinstance(key, str):
             return
-        parts = [item.strip() for item in messages if isinstance(item, str) and item.strip()]
-        if len(parts) >= 2:
-            request.prompt = self._join_messages(parts)
+        burst = self._bursts.get(key)
+        if burst is not None and burst.current_event is event:
+            burst.tools_started = True
 
     @filter.on_decorating_result(priority=1000)
     async def suppress_stale_result(self, event: AstrMessageEvent) -> None:
@@ -103,14 +147,6 @@ class MessageMergerPlugin(Star):
                 result.chain = []
             event.stop_event()
             return
-
-        # Clean up before sending because another plugin may stop after_message_sent hooks.
-        key = event.get_extra(self._extra_key("key"), None)
-        if not isinstance(key, str):
-            return
-        burst = self._bursts.get(key)
-        if burst is not None and burst.current_event is event:
-            self._bursts.pop(key, None)
 
     def _is_early_llm_candidate(self, event: AstrMessageEvent) -> bool:
         if not self._enabled():
@@ -126,8 +162,40 @@ class MessageMergerPlugin(Star):
 
     def _prune_bursts(self) -> None:
         cutoff = time.monotonic() - 120.0
-        expired = [key for key, burst in self._bursts.items() if burst.updated_at < cutoff]
+        expired = [
+            key
+            for key, burst in self._bursts.items()
+            if burst.updated_at < cutoff
+            and (burst.pipeline_task is None or burst.pipeline_task.done())
+        ]
         for key in expired:
+            self._bursts.pop(key, None)
+
+    def _must_start_new_burst(self, burst: Burst) -> bool:
+        task = burst.pipeline_task
+        if burst.tools_started or (task is not None and task.done()):
+            return True
+        previous = burst.current_event
+        if previous is None:
+            return False
+        result_getter = getattr(previous, "get_result", None)
+        result = result_getter() if callable(result_getter) else None
+        content_type = getattr(result, "result_content_type", None)
+        content_type_name = getattr(content_type, "name", str(content_type or ""))
+        return "STREAMING" in content_type_name.upper()
+
+    def _on_pipeline_done(
+        self,
+        key: str,
+        event: AstrMessageEvent,
+        task: asyncio.Task[Any],
+    ) -> None:
+        burst = self._bursts.get(key)
+        if (
+            burst is not None
+            and burst.current_event is event
+            and burst.pipeline_task is task
+        ):
             self._bursts.pop(key, None)
 
     def _join_messages(self, messages: list[str]) -> str:

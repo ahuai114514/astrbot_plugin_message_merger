@@ -10,7 +10,7 @@
     "default": 8
   },
   "max_chars": {
-    "description": "一次最多合并的字符数，设为 0 则不限制",
+    "description": "合并历史消息的字符预算，设为 0 则不限制；不会截断当前消息",
     "type": "int",
     "default": 4000
   },
