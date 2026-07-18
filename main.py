@@ -23,7 +23,7 @@ class Burst:
     updated_at: float = field(default_factory=time.monotonic)
 
 
-@register(PLUGIN_ID, "Codex", "零等待取消旧请求并合并后续消息", "1.1.0")
+@register(PLUGIN_ID, "Codex", "零等待取消旧请求并合并后续消息", "1.1.1")
 class MessageMergerPlugin(Star):
     """Merge follow-up user messages without delaying the initial request."""
 
@@ -151,9 +151,11 @@ class MessageMergerPlugin(Star):
     def _is_early_llm_candidate(self, event: AstrMessageEvent) -> bool:
         if not self._enabled():
             return False
-        private_getter = getattr(event, "is_private_chat", None)
-        if callable(private_getter) and private_getter():
-            return True
+        stopped_getter = getattr(event, "is_stopped", None)
+        if callable(stopped_getter) and stopped_getter():
+            return False
+        if bool(getattr(event, "_has_send_oper", False)):
+            return False
         return bool(
             getattr(event, "call_llm", False)
             or getattr(event, "is_wake", False)
@@ -211,7 +213,7 @@ class MessageMergerPlugin(Star):
         components = getattr(message_obj, "message", None)
         if not isinstance(components, (list, tuple)):
             return True
-        allowed = {"Plain", "At", "Reply"}
+        allowed = {"Plain", "At"}
         return all(type(component).__name__ in allowed for component in components)
 
     def _message_text(self, event: AstrMessageEvent) -> str:
