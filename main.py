@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,11 +16,11 @@ EXTRA_PREFIX = "message_merger"
 @dataclass
 class Burst:
     messages: list[str] = field(default_factory=list)
-    sequence: int = 0
     current_event: AstrMessageEvent | None = None
+    updated_at: float = field(default_factory=time.monotonic)
 
 
-@register(PLUGIN_ID, "Codex", "立即回复并在后续消息到达时乐观合并", "1.0.0")
+@register(PLUGIN_ID, "Codex", "立即回复并在后续消息到达时乐观合并", "1.0.1")
 class MessageMergerPlugin(Star):
     """Merge follow-up user messages without delaying the initial request."""
 
@@ -28,16 +29,31 @@ class MessageMergerPlugin(Star):
         self.config = config
         self._bursts: dict[str, Burst] = {}
 
+    @filter.regex(r"^[\s\S]*$")
+    async def capture_incoming_message(self, event: AstrMessageEvent):
+        """Capture before the event reaches the per-conversation LLM queue."""
+        if self._is_early_llm_candidate(event):
+            self._capture(event)
+        if False:
+            # Regex handlers are async generators in AstrBot's plugin pipeline.
+            yield None
+
     @filter.on_waiting_llm_request(priority=1000)
     async def collect_message(self, event: AstrMessageEvent) -> None:
+        # Some adapters decide call_llm after regular handlers; capture those here.
+        if event.get_extra(self._extra_key("captured"), False):
+            return
+        self._capture(event)
+
+    def _capture(self, event: AstrMessageEvent) -> None:
         if not self._enabled():
             return
-
         text = self._message_text(event)
         key = self._conversation_key(event)
         if not text or not key or not self._mergeable(event, text):
             return
 
+        self._prune_bursts()
         burst = self._bursts.get(key)
         if burst is None:
             burst = Burst()
@@ -60,8 +76,9 @@ class MessageMergerPlugin(Star):
         ):
             burst.messages.pop(0)
 
-        burst.sequence += 1
         burst.current_event = event
+        burst.updated_at = time.monotonic()
+        event.set_extra(self._extra_key("captured"), True)
         event.set_extra(self._extra_key("key"), key)
         event.set_extra(self._extra_key("merged_messages"), list(burst.messages))
 
@@ -80,20 +97,37 @@ class MessageMergerPlugin(Star):
 
     @filter.on_decorating_result(priority=1000)
     async def suppress_stale_result(self, event: AstrMessageEvent) -> None:
-        if not event.get_extra(self._extra_key("stale"), False):
+        if event.get_extra(self._extra_key("stale"), False):
+            result = event.get_result()
+            if result is not None and getattr(result, "chain", None) is not None:
+                result.chain = []
+            event.stop_event()
             return
-        result = event.get_result()
-        if result is not None and getattr(result, "chain", None) is not None:
-            result.chain = []
-        event.stop_event()
 
-    @filter.after_message_sent()
-    async def cleanup_burst(self, event: AstrMessageEvent) -> None:
+        # Clean up before sending because another plugin may stop after_message_sent hooks.
         key = event.get_extra(self._extra_key("key"), None)
         if not isinstance(key, str):
             return
         burst = self._bursts.get(key)
         if burst is not None and burst.current_event is event:
+            self._bursts.pop(key, None)
+
+    def _is_early_llm_candidate(self, event: AstrMessageEvent) -> bool:
+        if not self._enabled():
+            return False
+        private_getter = getattr(event, "is_private_chat", None)
+        if callable(private_getter) and private_getter():
+            return True
+        return bool(
+            getattr(event, "call_llm", False)
+            or getattr(event, "is_wake", False)
+            or getattr(event, "is_at_or_wake_command", False)
+        )
+
+    def _prune_bursts(self) -> None:
+        cutoff = time.monotonic() - 120.0
+        expired = [key for key, burst in self._bursts.items() if burst.updated_at < cutoff]
+        for key in expired:
             self._bursts.pop(key, None)
 
     def _join_messages(self, messages: list[str]) -> str:
