@@ -15,15 +15,21 @@ EXTRA_PREFIX = "message_merger"
 
 
 @dataclass
+class BufferedMessage:
+    sequence: int
+    text: str
+
+
+@dataclass
 class Burst:
-    messages: list[str] = field(default_factory=list)
+    messages: list[BufferedMessage] = field(default_factory=list)
     current_event: AstrMessageEvent | None = None
     pipeline_task: asyncio.Task[Any] | None = None
     tools_started: bool = False
     updated_at: float = field(default_factory=time.monotonic)
 
 
-@register(PLUGIN_ID, "Codex", "零等待取消旧请求并合并后续消息", "1.1.2")
+@register(PLUGIN_ID, "Codex", "零等待取消旧请求并合并后续消息", "1.1.3")
 class MessageMergerPlugin(Star):
     """Merge follow-up user messages without delaying the initial request."""
 
@@ -31,6 +37,12 @@ class MessageMergerPlugin(Star):
         super().__init__(context)
         self.config = config
         self._bursts: dict[str, Burst] = {}
+        self._arrival_sequence = 0
+
+    @filter.regex(r"^[\s\S]*$", priority=10000)
+    async def stamp_message_arrival(self, event: AstrMessageEvent) -> None:
+        if self._enabled():
+            self._ensure_arrival_sequence(event)
 
     @filter.regex(r"^[\s\S]*$", priority=-10000)
     async def capture_incoming_message(self, event: AstrMessageEvent) -> None:
@@ -93,12 +105,14 @@ class MessageMergerPlugin(Star):
 
         max_messages = self._safe_int("max_messages", 8, minimum=0)
         max_chars = self._safe_int("max_chars", 4000, minimum=0)
-        burst.messages.append(text)
+        sequence = self._ensure_arrival_sequence(event)
+        burst.messages.append(BufferedMessage(sequence=sequence, text=text))
+        burst.messages.sort(key=lambda item: item.sequence)
         if max_messages > 0 and len(burst.messages) > max_messages:
             burst.messages = burst.messages[-max_messages:]
         while (
             max_chars > 0
-            and sum(len(item) for item in burst.messages) > max_chars
+            and sum(len(item.text) for item in burst.messages) > max_chars
             and len(burst.messages) > 1
         ):
             burst.messages.pop(0)
@@ -107,7 +121,10 @@ class MessageMergerPlugin(Star):
         burst.updated_at = time.monotonic()
         event.set_extra(self._extra_key("captured"), True)
         event.set_extra(self._extra_key("key"), key)
-        event.set_extra(self._extra_key("merged_messages"), list(burst.messages))
+        event.set_extra(
+            self._extra_key("merged_messages"),
+            [item.text for item in burst.messages],
+        )
         self._bind_pipeline_task(burst, key, event)
 
     @filter.on_llm_request(priority=1000)
@@ -214,6 +231,15 @@ class MessageMergerPlugin(Star):
 
     def _join_messages(self, messages: list[str]) -> str:
         return "\n".join(messages)
+
+    def _ensure_arrival_sequence(self, event: AstrMessageEvent) -> int:
+        key = self._extra_key("arrival_sequence")
+        existing = event.get_extra(key, None)
+        if isinstance(existing, int) and existing > 0:
+            return existing
+        self._arrival_sequence += 1
+        event.set_extra(key, self._arrival_sequence)
+        return self._arrival_sequence
 
     def _mergeable(self, event: AstrMessageEvent, text: str) -> bool:
         prefixes = self._config_get("ignore_prefixes", ["/", "!"])
