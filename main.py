@@ -23,7 +23,7 @@ class Burst:
     updated_at: float = field(default_factory=time.monotonic)
 
 
-@register(PLUGIN_ID, "Codex", "零等待取消旧请求并合并后续消息", "1.1.1")
+@register(PLUGIN_ID, "Codex", "零等待取消旧请求并合并后续消息", "1.1.2")
 class MessageMergerPlugin(Star):
     """Merge follow-up user messages without delaying the initial request."""
 
@@ -65,17 +65,7 @@ class MessageMergerPlugin(Star):
                 if message_obj is not None:
                     message_obj.message_str = merged
 
-        task = asyncio.current_task()
-        if task is None:
-            return
-        burst.pipeline_task = task
-        task.add_done_callback(
-            lambda completed, burst_key=key, current_event=event: self._on_pipeline_done(
-                burst_key,
-                current_event,
-                completed,
-            )
-        )
+        self._bind_pipeline_task(burst, key, event)
 
     def _capture(self, event: AstrMessageEvent) -> None:
         if not self._enabled():
@@ -118,6 +108,7 @@ class MessageMergerPlugin(Star):
         event.set_extra(self._extra_key("captured"), True)
         event.set_extra(self._extra_key("key"), key)
         event.set_extra(self._extra_key("merged_messages"), list(burst.messages))
+        self._bind_pipeline_task(burst, key, event)
 
     @filter.on_llm_request(priority=1000)
     async def merge_request(self, event: AstrMessageEvent, request: Any) -> None:
@@ -199,6 +190,27 @@ class MessageMergerPlugin(Star):
             and burst.pipeline_task is task
         ):
             self._bursts.pop(key, None)
+
+    def _bind_pipeline_task(
+        self,
+        burst: Burst,
+        key: str,
+        event: AstrMessageEvent,
+    ) -> None:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        if task is None or burst.pipeline_task is task:
+            return
+        burst.pipeline_task = task
+        task.add_done_callback(
+            lambda completed, burst_key=key, current_event=event: self._on_pipeline_done(
+                burst_key,
+                current_event,
+                completed,
+            )
+        )
 
     def _join_messages(self, messages: list[str]) -> str:
         return "\n".join(messages)
