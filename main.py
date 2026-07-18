@@ -29,7 +29,7 @@ class Burst:
     updated_at: float = field(default_factory=time.monotonic)
 
 
-@register(PLUGIN_ID, "Codex", "零等待取消旧请求并合并后续消息", "1.1.3")
+@register(PLUGIN_ID, "Codex", "零等待取消旧请求并合并后续消息", "1.1.4")
 class MessageMergerPlugin(Star):
     """Merge follow-up user messages without delaying the initial request."""
 
@@ -62,7 +62,9 @@ class MessageMergerPlugin(Star):
         if not isinstance(key, str):
             return
         burst = self._bursts.get(key)
-        if burst is None or burst.current_event is not event:
+        is_current_burst = burst is not None and burst.current_event is event
+        is_detached_burst = bool(event.get_extra(self._extra_key("detached"), False))
+        if not is_current_burst and not is_detached_burst:
             event.set_extra(self._extra_key("stale"), True)
             event.stop_event()
             return
@@ -77,7 +79,8 @@ class MessageMergerPlugin(Star):
                 if message_obj is not None:
                     message_obj.message_str = merged
 
-        self._bind_pipeline_task(burst, key, event)
+        if is_current_burst and burst is not None:
+            self._bind_pipeline_task(burst, key, event)
 
     def _capture(self, event: AstrMessageEvent) -> None:
         if not self._enabled():
@@ -88,8 +91,26 @@ class MessageMergerPlugin(Star):
             return
 
         self._prune_bursts()
+        max_messages = self._safe_int("max_messages", 8, minimum=0)
+        max_chars = self._safe_int("max_chars", 4000, minimum=0)
+        sequence = self._ensure_arrival_sequence(event)
+        buffered_message = BufferedMessage(sequence=sequence, text=text)
+
         burst = self._bursts.get(key)
-        if burst is not None and self._must_start_new_burst(burst):
+        start_new_burst = burst is None
+        if burst is not None:
+            start_new_burst = self._must_start_new_burst(burst) or self._would_exceed_limits(
+                burst,
+                buffered_message,
+                max_messages,
+                max_chars,
+            )
+            if start_new_burst:
+                previous = burst.current_event
+                if previous is not None:
+                    previous.set_extra(self._extra_key("detached"), True)
+
+        if start_new_burst:
             burst = None
         if burst is None:
             burst = Burst()
@@ -103,19 +124,8 @@ class MessageMergerPlugin(Star):
                 if previous_task is not None and not previous_task.done():
                     previous_task.cancel()
 
-        max_messages = self._safe_int("max_messages", 8, minimum=0)
-        max_chars = self._safe_int("max_chars", 4000, minimum=0)
-        sequence = self._ensure_arrival_sequence(event)
-        burst.messages.append(BufferedMessage(sequence=sequence, text=text))
+        burst.messages.append(buffered_message)
         burst.messages.sort(key=lambda item: item.sequence)
-        if max_messages > 0 and len(burst.messages) > max_messages:
-            burst.messages = burst.messages[-max_messages:]
-        while (
-            max_chars > 0
-            and sum(len(item.text) for item in burst.messages) > max_chars
-            and len(burst.messages) > 1
-        ):
-            burst.messages.pop(0)
 
         burst.current_event = event
         burst.updated_at = time.monotonic()
@@ -194,6 +204,21 @@ class MessageMergerPlugin(Star):
         content_type_name = getattr(content_type, "name", str(content_type or ""))
         return "STREAMING" in content_type_name.upper()
 
+    def _would_exceed_limits(
+        self,
+        burst: Burst,
+        message: BufferedMessage,
+        max_messages: int,
+        max_chars: int,
+    ) -> bool:
+        if max_messages > 0 and len(burst.messages) + 1 > max_messages:
+            return True
+        if max_chars > 0:
+            current_chars = sum(len(item.text) for item in burst.messages)
+            if current_chars + len(message.text) > max_chars:
+                return True
+        return False
+
     def _on_pipeline_done(
         self,
         key: str,
@@ -244,7 +269,9 @@ class MessageMergerPlugin(Star):
     def _mergeable(self, event: AstrMessageEvent, text: str) -> bool:
         prefixes = self._config_get("ignore_prefixes", ["/", "!"])
         if isinstance(prefixes, list) and any(
-            text.startswith(item) for item in prefixes if isinstance(item, str)
+            text.startswith(item)
+            for item in prefixes
+            if isinstance(item, str) and item
         ):
             return False
         message_obj = getattr(event, "message_obj", None)
