@@ -16,7 +16,7 @@ EXTRA_PREFIX = "message_merger"
 
 @dataclass
 class BufferedMessage:
-    sequence: int
+    sequence: tuple[float, int]
     text: str
 
 
@@ -29,7 +29,7 @@ class Burst:
     updated_at: float = field(default_factory=time.monotonic)
 
 
-@register(PLUGIN_ID, "ahuai", "零等待合并用户未说完的连续消息", "1.1.4")
+@register(PLUGIN_ID, "ahuai", "零等待合并用户未说完的连续消息", "1.2.0")
 class MessageMergerPlugin(Star):
     """Merge follow-up user messages without delaying the initial request."""
 
@@ -39,20 +39,8 @@ class MessageMergerPlugin(Star):
         self._bursts: dict[str, Burst] = {}
         self._arrival_sequence = 0
 
-    @filter.regex(r"^[\s\S]*$", priority=10000)
-    async def stamp_message_arrival(self, event: AstrMessageEvent) -> None:
-        if self._enabled():
-            self._ensure_arrival_sequence(event)
-
-    @filter.regex(r"^[\s\S]*$", priority=-10000)
-    async def capture_incoming_message(self, event: AstrMessageEvent) -> None:
-        """Run after business handlers but before the default LLM pipeline."""
-        if self._is_early_llm_candidate(event):
-            self._capture(event)
-
     @filter.on_waiting_llm_request(priority=1000)
     async def register_pipeline_task(self, event: AstrMessageEvent) -> None:
-        # Some adapters decide call_llm after regular handlers; capture those here.
         if event.get_extra(self._extra_key("captured"), False):
             key = event.get_extra(self._extra_key("key"), None)
         else:
@@ -166,20 +154,6 @@ class MessageMergerPlugin(Star):
             event.stop_event()
             return
 
-    def _is_early_llm_candidate(self, event: AstrMessageEvent) -> bool:
-        if not self._enabled():
-            return False
-        stopped_getter = getattr(event, "is_stopped", None)
-        if callable(stopped_getter) and stopped_getter():
-            return False
-        if bool(getattr(event, "_has_send_oper", False)):
-            return False
-        return bool(
-            getattr(event, "call_llm", False)
-            or getattr(event, "is_wake", False)
-            or getattr(event, "is_at_or_wake_command", False)
-        )
-
     def _prune_bursts(self) -> None:
         cutoff = time.monotonic() - 120.0
         expired = [
@@ -257,29 +231,80 @@ class MessageMergerPlugin(Star):
     def _join_messages(self, messages: list[str]) -> str:
         return "\n".join(messages)
 
-    def _ensure_arrival_sequence(self, event: AstrMessageEvent) -> int:
+    def _ensure_arrival_sequence(
+        self,
+        event: AstrMessageEvent,
+    ) -> tuple[float, int]:
         key = self._extra_key("arrival_sequence")
         existing = event.get_extra(key, None)
-        if isinstance(existing, int) and existing > 0:
-            return existing
+        if (
+            isinstance(existing, tuple)
+            and len(existing) == 2
+            and isinstance(existing[0], int | float)
+            and isinstance(existing[1], int)
+        ):
+            return float(existing[0]), existing[1]
+
         self._arrival_sequence += 1
-        event.set_extra(key, self._arrival_sequence)
-        return self._arrival_sequence
+        try:
+            created_at = float(getattr(event, "created_at", time.time()))
+        except (TypeError, ValueError):
+            created_at = time.time()
+        sequence = (created_at, self._arrival_sequence)
+        event.set_extra(key, sequence)
+        return sequence
 
     def _mergeable(self, event: AstrMessageEvent, text: str) -> bool:
-        prefixes = self._config_get("ignore_prefixes", ["/", "!"])
-        if isinstance(prefixes, list) and any(
-            text.startswith(item)
-            for item in prefixes
-            if isinstance(item, str) and item
-        ):
-            return False
         message_obj = getattr(event, "message_obj", None)
+        original_text = getattr(message_obj, "message_str", None)
+        prefix_text = (
+            original_text.strip()
+            if isinstance(original_text, str) and original_text.strip()
+            else text
+        )
+
+        if bool(self._config_get("ignore_prefixes_enabled", True)):
+            prefixes = self._config_get("ignore_prefixes", ["/", "!"])
+            if isinstance(prefixes, list) and any(
+                prefix_text.startswith(item)
+                for item in prefixes
+                if isinstance(item, str) and item
+            ):
+                return False
+
+        group_getter = getattr(event, "get_group_id", None)
+        group_id = group_getter() if callable(group_getter) else None
+        is_group_message = group_id is not None and bool(str(group_id).strip())
         components = getattr(message_obj, "message", None)
+        if is_group_message and bool(
+            self._config_get("required_prefixes_enabled", False)
+        ):
+            required_prefixes = self._config_get("required_prefixes", [])
+            matches_required_prefix = isinstance(required_prefixes, list) and any(
+                prefix_text.startswith(item)
+                for item in required_prefixes
+                if isinstance(item, str) and item
+            )
+            if not matches_required_prefix and not self._mentions_bot(event, components):
+                return False
+
         if not isinstance(components, (list, tuple)):
             return True
         allowed = {"Plain", "At"}
         return all(type(component).__name__ in allowed for component in components)
+
+    def _mentions_bot(self, event: AstrMessageEvent, components: Any) -> bool:
+        if not isinstance(components, (list, tuple)):
+            return False
+        self_id_getter = getattr(event, "get_self_id", None)
+        self_id = self_id_getter() if callable(self_id_getter) else None
+        if self_id is None or not str(self_id).strip():
+            return False
+        return any(
+            type(component).__name__ == "At"
+            and str(getattr(component, "qq", "")) == str(self_id)
+            for component in components
+        )
 
     def _message_text(self, event: AstrMessageEvent) -> str:
         text = getattr(event, "message_str", "")

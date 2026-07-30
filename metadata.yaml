@@ -2,7 +2,7 @@ name: astrbot_plugin_message_merger
 display_name: 消息防抖
 short_desc: 零等待合并用户未说完的连续消息
 desc: 类似消息防抖：首条消息零等待进入模型；若同一用户在回复完成前继续发送，则取消旧请求，合并连续消息后重新生成回复。
-version: v1.1.4
+version: v1.2.0
 author: ahuai
 repo: https://github.com/ahuai114514/astrbot_plugin_message_merger
 astrbot_version: ">=4.25,<5"

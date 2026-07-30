@@ -15,10 +15,29 @@
     "type": "int",
     "default": 4000
   },
+  "ignore_prefixes_enabled": {
+    "description": "是否启用忽略前缀规则",
+    "hint": "开启后，以忽略前缀开头的消息不参与合并。忽略规则的优先级高于仅合并指定前缀规则。",
+    "type": "bool",
+    "default": true
+  },
   "ignore_prefixes": {
-    "description": "以这些前缀开头的消息不参与合并",
+    "description": "不参与合并的消息前缀",
     "type": "list",
     "items": {"type": "string"},
     "default": ["/", "!"]
+  },
+  "required_prefixes_enabled": {
+    "description": "是否仅合并指定前缀或 @ 机器人的消息（仅群聊生效）",
+    "hint": "开启后，群聊中只合并以指定前缀开头或明确 @ 当前机器人的消息；列表为空时仍允许 @ 机器人的消息。@ 其他用户不算匹配，私聊不受此规则影响。",
+    "type": "bool",
+    "default": false
+  },
+  "required_prefixes": {
+    "description": "群聊中允许参与合并的消息前缀",
+    "hint": "仅在‘仅合并指定前缀或 @ 机器人’开启时生效；此列表不影响 @ 机器人的消息。",
+    "type": "list",
+    "items": {"type": "string"},
+    "default": []
   }
 }
