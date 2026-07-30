@@ -1,7 +1,7 @@
 name: astrbot_plugin_message_merger
-display_name: message_merger
-short_desc: 零等待取消旧请求并合并后续消息
-desc: 首条消息立即请求模型；同一用户继续发送时取消仍在运行的旧请求，并让最新事件携带合并消息重新请求。
+display_name: 消息防抖
+short_desc: 零等待合并用户未说完的连续消息
+desc: 类似消息防抖：首条消息零等待进入模型；若同一用户在回复完成前继续发送，则取消旧请求，合并连续消息后重新生成回复。
 version: v1.1.4
 author: ahuai
 repo: https://github.com/ahuai114514/astrbot_plugin_message_merger

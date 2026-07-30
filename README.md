@@ -1,8 +1,8 @@
-# astrbot_plugin_message_merger
+# 消息防抖（astrbot_plugin_message_merger）
 
 该项目由 Codex 编写。
 
-这是一个 AstrBot 消息合并插件，采用“零等待取消”策略：第一条消息立即进入原有 LLM 流程，不增加静默等待；如果同一用户在旧请求完成前继续发消息，插件会取消旧的 AstrBot pipeline task，并让最新事件携带已经合并的消息重新生成。
+这是一个类消息防抖的 AstrBot 插件，用于合并用户还没说完的连续消息。插件采用“零等待”策略：第一条消息立即进入原有 LLM 流程，不增加静默等待；如果同一用户在旧请求完成前继续发送消息，插件会取消旧的 AstrBot pipeline task，合并连续消息后重新生成回复。
 
 ## 行为
 

@@ -29,7 +29,7 @@ class Burst:
     updated_at: float = field(default_factory=time.monotonic)
 
 
-@register(PLUGIN_ID, "ahuai", "零等待取消旧请求并合并后续消息", "1.1.4")
+@register(PLUGIN_ID, "ahuai", "零等待合并用户未说完的连续消息", "1.1.4")
 class MessageMergerPlugin(Star):
     """Merge follow-up user messages without delaying the initial request."""
 
