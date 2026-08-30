@@ -29,7 +29,7 @@ class Burst:
     updated_at: float = field(default_factory=time.monotonic)
 
 
-@register(PLUGIN_ID, "ahuai", "零等待合并用户未说完的连续消息", "1.2.0")
+@register(PLUGIN_ID, "ahuai", "零等待合并用户未说完的连续消息", "1.2.1")
 class MessageMergerPlugin(Star):
     """Merge follow-up user messages without delaying the initial request."""
 
@@ -38,6 +38,18 @@ class MessageMergerPlugin(Star):
         self.config = config
         self._bursts: dict[str, Burst] = {}
         self._arrival_sequence = 0
+
+    @filter.regex(r"^[\s\S]*$", priority=10000)
+    async def stamp_message_arrival(self, event: AstrMessageEvent) -> None:
+        """Record adapter arrival order before other handlers can delay events."""
+        if self._enabled():
+            self._ensure_arrival_sequence(event)
+
+    @filter.regex(r"^[\s\S]*$", priority=-10000)
+    async def capture_incoming_message(self, event: AstrMessageEvent) -> None:
+        """Capture LLM-bound messages before the default pipeline starts."""
+        if self._is_early_llm_candidate(event):
+            self._capture(event)
 
     @filter.on_waiting_llm_request(priority=1000)
     async def register_pipeline_task(self, event: AstrMessageEvent) -> None:
@@ -153,6 +165,20 @@ class MessageMergerPlugin(Star):
                 result.chain = []
             event.stop_event()
             return
+
+    def _is_early_llm_candidate(self, event: AstrMessageEvent) -> bool:
+        if not self._enabled():
+            return False
+        stopped_getter = getattr(event, "is_stopped", None)
+        if callable(stopped_getter) and stopped_getter():
+            return False
+        if bool(getattr(event, "_has_send_oper", False)):
+            return False
+        return bool(
+            getattr(event, "call_llm", False)
+            or getattr(event, "is_wake", False)
+            or getattr(event, "is_at_or_wake_command", False)
+        )
 
     def _prune_bursts(self) -> None:
         cutoff = time.monotonic() - 120.0
