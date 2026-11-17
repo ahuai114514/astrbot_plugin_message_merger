@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
-
 
 PLUGIN_ID = "astrbot_plugin_message_merger"
 EXTRA_PREFIX = "message_merger"
@@ -18,6 +18,7 @@ EXTRA_PREFIX = "message_merger"
 class BufferedMessage:
     sequence: tuple[float, int]
     text: str
+    components: list[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -29,7 +30,7 @@ class Burst:
     updated_at: float = field(default_factory=time.monotonic)
 
 
-@register(PLUGIN_ID, "ahuai", "零等待合并用户未说完的连续消息", "1.2.1")
+@register(PLUGIN_ID, "ahuai", "零等待合并用户未说完的连续消息", "1.3.0")
 class MessageMergerPlugin(Star):
     """Merge follow-up user messages without delaying the initial request."""
 
@@ -71,13 +72,19 @@ class MessageMergerPlugin(Star):
 
         messages = event.get_extra(self._extra_key("merged_messages"), None)
         if isinstance(messages, list):
-            parts = [item.strip() for item in messages if isinstance(item, str) and item.strip()]
-            if parts:
-                merged = self._join_messages(parts)
-                event.message_str = merged
-                message_obj = getattr(event, "message_obj", None)
-                if message_obj is not None:
-                    message_obj.message_str = merged
+            parts = [
+                item.strip()
+                for item in messages
+                if isinstance(item, str) and item.strip()
+            ]
+            merged = self._join_messages(parts)
+            event.message_str = merged
+            message_obj = getattr(event, "message_obj", None)
+            if message_obj is not None:
+                message_obj.message_str = merged
+                components = event.get_extra(self._extra_key("merged_components"), None)
+                if isinstance(components, list):
+                    message_obj.message = deepcopy(components)
 
         if is_current_burst and burst is not None:
             self._bind_pipeline_task(burst, key, event)
@@ -85,21 +92,30 @@ class MessageMergerPlugin(Star):
     def _capture(self, event: AstrMessageEvent) -> None:
         if not self._enabled():
             return
+        if event.get_extra(self._extra_key("captured"), False):
+            return
         text = self._message_text(event)
+        components = getattr(getattr(event, "message_obj", None), "message", None)
+        components = list(components) if isinstance(components, (list, tuple)) else []
+        has_image = any(type(component).__name__ == "Image" for component in components)
         key = self._conversation_key(event)
-        if not text or not key or not self._mergeable(event, text):
+        if (not text and not has_image) or not key or not self._mergeable(event, text):
             return
 
         self._prune_bursts()
         max_messages = self._safe_int("max_messages", 8, minimum=0)
         max_chars = self._safe_int("max_chars", 4000, minimum=0)
         sequence = self._ensure_arrival_sequence(event)
-        buffered_message = BufferedMessage(sequence=sequence, text=text)
+        buffered_message = BufferedMessage(
+            sequence=sequence, text=text, components=deepcopy(components)
+        )
 
         burst = self._bursts.get(key)
         start_new_burst = burst is None
         if burst is not None:
-            start_new_burst = self._must_start_new_burst(burst) or self._would_exceed_limits(
+            start_new_burst = self._must_start_new_burst(
+                burst
+            ) or self._would_exceed_limits(
                 burst,
                 buffered_message,
                 max_messages,
@@ -134,6 +150,10 @@ class MessageMergerPlugin(Star):
         event.set_extra(
             self._extra_key("merged_messages"),
             [item.text for item in burst.messages],
+        )
+        event.set_extra(
+            self._extra_key("merged_components"),
+            [component for item in burst.messages for component in item.components],
         )
         self._bind_pipeline_task(burst, key, event)
 
@@ -247,10 +267,12 @@ class MessageMergerPlugin(Star):
             return
         burst.pipeline_task = task
         task.add_done_callback(
-            lambda completed, burst_key=key, current_event=event: self._on_pipeline_done(
-                burst_key,
-                current_event,
-                completed,
+            lambda completed, burst_key=key, current_event=event: (
+                self._on_pipeline_done(
+                    burst_key,
+                    current_event,
+                    completed,
+                )
             )
         )
 
@@ -311,12 +333,14 @@ class MessageMergerPlugin(Star):
                 for item in required_prefixes
                 if isinstance(item, str) and item
             )
-            if not matches_required_prefix and not self._mentions_bot(event, components):
+            if not matches_required_prefix and not self._mentions_bot(
+                event, components
+            ):
                 return False
 
         if not isinstance(components, (list, tuple)):
             return True
-        allowed = {"Plain", "At"}
+        allowed = {"Plain", "At", "Image"}
         return all(type(component).__name__ in allowed for component in components)
 
     def _mentions_bot(self, event: AstrMessageEvent, components: Any) -> bool:
@@ -371,14 +395,20 @@ class MessageMergerPlugin(Star):
         try:
             return max(minimum, int(self._config_get(key, default)))
         except (TypeError, ValueError):
-            logger.warning("[%s] invalid integer config %s; using %s", PLUGIN_ID, key, default)
+            logger.warning(
+                "[%s] invalid integer config %s; using %s", PLUGIN_ID, key, default
+            )
             return default
 
     def _config_get(self, key: str, default: Any) -> Any:
         if self.config is None:
             return default
         getter = getattr(self.config, "get", None)
-        return getter(key, default) if callable(getter) else getattr(self.config, key, default)
+        return (
+            getter(key, default)
+            if callable(getter)
+            else getattr(self.config, key, default)
+        )
 
     def _extra_key(self, name: str) -> str:
         return f"{EXTRA_PREFIX}.{name}"
